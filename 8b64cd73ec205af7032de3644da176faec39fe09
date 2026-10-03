@@ -1,0 +1,16 @@
+Oracle PushSecret recreate of a remoteKey whose OCI secret is PENDING_DELETION.
+
+Hypothesis confirmed in providers/v1/oracle/oracle.go: DeleteSecret calls
+ScheduleSecretDeletion with an empty body, so OCI applies its 30-day default.
+Nothing in the provider called CancelSecretDeletion. GetSecretBundleByName is
+the existence check, and a 404 is treated as SecretNotFound, so PushSecret
+takes the create path. Live measurements on the issue show that call 404s for
+PENDING_DELETION and CreateSecret then returns 400 name already exists.
+
+Did not set TimeOfDeletion to the 1-day minimum. That only shortens the
+reservation and changes deletion behavior for every existing store (called a
+breaking change on PR 6861). Reuse is implemented by listing the secret by
+name, canceling scheduled deletion, and updating once the bundle is readable.
+Transitional states return a retryable error because vault transitions are
+asynchronous. A 409 IncorrectState from CancelSecretDeletion is ignored so a
+second reconcile does not fail while OCI is already canceling.
