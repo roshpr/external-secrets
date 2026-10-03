@@ -94,6 +94,8 @@ kubectl get secret oracle-secret-to-create -o jsonpath='{.data.dev-secret-test}'
 When using [PushSecrets](https://external-secrets.io/latest/guides/pushsecrets/), the compartment OCID and encryption key OCID must be specified in the
 Oracle SecretStore. You can find your compartment and encryption key OCIDs in the OCI console.
 
+Deleting a PushSecret with `deletionPolicy: Delete` schedules the OCI secret for deletion. OCI keeps that name reserved until the deletion completes, which is 30 days when no deletion time is set. Recreating the PushSecret with the same `remoteKey` cancels the scheduled deletion and writes the new value. Vault state changes are asynchronous, so the reconcile retries until the secret is active again instead of failing for the rest of the deletion window.
+
 If [retrieving multiple secrets](https://external-secrets.io/latest/guides/getallsecrets/) by tag or regex, only the compartment OCID must be specified.
 
 ```yaml

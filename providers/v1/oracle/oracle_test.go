@@ -702,6 +702,203 @@ func TestOracleVaultPushSecret(t *testing.T) {
 	}
 }
 
+func TestPushSecretReusesPendingDeletionName(t *testing.T) {
+	const (
+		testSecretKey = "test-secret-key"
+		encryptionKey = "must-not-be-blank-for-push"
+		secretOCID    = "ocid1.vaultsecret.oc1..pending"
+		compartment   = "ocid1.compartment.oc1..example"
+		vaultID       = "ocid1.vault.oc1..example"
+	)
+	deletionTime := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+	remote := testingfake.PushSecretData{
+		SecretKey: testSecretKey,
+		RemoteKey: s1id,
+	}
+	nameTaken := &fakeoracle.ServiceError{
+		Code:    400,
+		OCICode: "InvalidParameter",
+		Message: "name already exists",
+	}
+
+	pending := makeSecretSummary(s1id, true)
+	pending.Id = new(secretOCID)
+	pending.LifecycleState = vault.SecretSummaryLifecycleStatePendingDeletion
+	pending.TimeOfDeletion = &common.SDKTime{Time: deletionTime}
+
+	creating := pending
+	creating.LifecycleState = vault.SecretSummaryLifecycleStateCreating
+	creating.TimeOfDeletion = nil
+
+	active := pending
+	active.LifecycleState = vault.SecretSummaryLifecycleStateActive
+	active.TimeOfDeletion = nil
+
+	t.Run("cancels pending deletion and updates once the bundle is readable", func(t *testing.T) {
+		client := &fakeoracle.OracleMockClient{
+			SecretBundles: map[string]secrets.SecretBundle{},
+		}
+		vaultClient := &fakeoracle.OracleMockVaultClient{
+			SecretSummaries: []vault.SecretSummary{pending},
+			CreateErr:       nameTaken,
+			OnCancel: func() {
+				bundle := makeSecretBundle(s1id, false)
+				bundle.SecretId = new(secretOCID)
+				client.SecretBundles[s1id] = bundle
+			},
+		}
+		vms := &VaultManagementService{
+			encryptionKey: encryptionKey,
+			compartment:   compartment,
+			vault:         vaultID,
+			Client:        client,
+			VaultClient:   vaultClient,
+		}
+
+		secret := &corev1.Secret{Data: map[string][]byte{testSecretKey: []byte("restored-value")}}
+		err := vms.PushSecret(context.Background(), secret, remote)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, vaultClient.CreatedCount)
+		assert.Equal(t, 1, vaultClient.CancelledCount)
+		assert.Equal(t, secretOCID, vaultClient.LastCancelledSecretID)
+		assert.Equal(t, 1, vaultClient.UpdatedCount)
+		assert.Equal(t, secretOCID, vaultClient.LastUpdatedSecretID)
+		if assert.NotNil(t, vaultClient.LastListRequest.Name) {
+			assert.Equal(t, s1id, *vaultClient.LastListRequest.Name)
+		}
+		if assert.NotNil(t, vaultClient.LastListRequest.CompartmentId) {
+			assert.Equal(t, compartment, *vaultClient.LastListRequest.CompartmentId)
+		}
+	})
+
+	t.Run("reports the reservation time when the secret stays unreadable after cancel", func(t *testing.T) {
+		client := &fakeoracle.OracleMockClient{
+			SecretBundles: map[string]secrets.SecretBundle{},
+		}
+		vaultClient := &fakeoracle.OracleMockVaultClient{
+			SecretSummaries: []vault.SecretSummary{pending},
+			CreateErr:       nameTaken,
+		}
+		vms := &VaultManagementService{
+			encryptionKey: encryptionKey,
+			compartment:   compartment,
+			vault:         vaultID,
+			Client:        client,
+			VaultClient:   vaultClient,
+		}
+
+		secret := &corev1.Secret{Data: map[string][]byte{testSecretKey: []byte("restored-value")}}
+		err := vms.PushSecret(context.Background(), secret, remote)
+		assert.EqualError(t, err, "oci vault secret \"test1\" is pending deletion until 2026-10-04T12:00:00Z; scheduled deletion was canceled and the secret will be updated once it is active")
+		assert.Equal(t, 1, vaultClient.CancelledCount)
+		assert.Equal(t, 0, vaultClient.UpdatedCount)
+
+		// The next reconcile sees the secret once OCI finishes canceling deletion.
+		bundle := makeSecretBundle(s1id, false)
+		bundle.SecretId = new(secretOCID)
+		client.SecretBundles[s1id] = bundle
+		err = vms.PushSecret(context.Background(), secret, remote)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, vaultClient.CancelledCount)
+		assert.Equal(t, 1, vaultClient.UpdatedCount)
+		assert.Equal(t, secretOCID, vaultClient.LastUpdatedSecretID)
+	})
+
+	t.Run("keeps going when cancel reports the secret is already changing", func(t *testing.T) {
+		vaultClient := &fakeoracle.OracleMockVaultClient{
+			SecretSummaries: []vault.SecretSummary{pending},
+			CreateErr:       nameTaken,
+			CancelErr: &fakeoracle.ServiceError{
+				Code:    409,
+				OCICode: "IncorrectState",
+				Message: "IncorrectState",
+			},
+		}
+		vms := &VaultManagementService{
+			encryptionKey: encryptionKey,
+			compartment:   compartment,
+			vault:         vaultID,
+			Client: &fakeoracle.OracleMockClient{
+				SecretBundles: map[string]secrets.SecretBundle{},
+			},
+			VaultClient: vaultClient,
+		}
+
+		secret := &corev1.Secret{Data: map[string][]byte{testSecretKey: []byte("restored-value")}}
+		err := vms.PushSecret(context.Background(), secret, remote)
+		assert.EqualError(t, err, "oci vault secret \"test1\" is pending deletion until 2026-10-04T12:00:00Z; scheduled deletion was canceled and the secret will be updated once it is active")
+		assert.Equal(t, 1, vaultClient.CancelledCount)
+		assert.Equal(t, 0, vaultClient.UpdatedCount)
+	})
+
+	t.Run("retries without canceling while the secret is still creating", func(t *testing.T) {
+		vaultClient := &fakeoracle.OracleMockVaultClient{
+			SecretSummaries: []vault.SecretSummary{creating},
+			CreateErr:       nameTaken,
+		}
+		vms := &VaultManagementService{
+			encryptionKey: encryptionKey,
+			compartment:   compartment,
+			vault:         vaultID,
+			Client: &fakeoracle.OracleMockClient{
+				SecretBundles: map[string]secrets.SecretBundle{},
+			},
+			VaultClient: vaultClient,
+		}
+
+		secret := &corev1.Secret{Data: map[string][]byte{testSecretKey: []byte("restored-value")}}
+		err := vms.PushSecret(context.Background(), secret, remote)
+		assert.EqualError(t, err, "oci vault secret \"test1\" is CREATING; retry once the vault finishes the previous operation")
+		assert.Equal(t, 0, vaultClient.CancelledCount)
+		assert.Equal(t, 0, vaultClient.UpdatedCount)
+	})
+
+	t.Run("updates an active secret whose bundle read raced with create", func(t *testing.T) {
+		vaultClient := &fakeoracle.OracleMockVaultClient{
+			SecretSummaries: []vault.SecretSummary{active},
+			CreateErr:       nameTaken,
+		}
+		vms := &VaultManagementService{
+			encryptionKey: encryptionKey,
+			compartment:   compartment,
+			vault:         vaultID,
+			Client: &fakeoracle.OracleMockClient{
+				SecretBundles: map[string]secrets.SecretBundle{},
+			},
+			VaultClient: vaultClient,
+		}
+
+		secret := &corev1.Secret{Data: map[string][]byte{testSecretKey: []byte("restored-value")}}
+		err := vms.PushSecret(context.Background(), secret, remote)
+		assert.NoError(t, err)
+		assert.Equal(t, 0, vaultClient.CancelledCount)
+		assert.Equal(t, 1, vaultClient.UpdatedCount)
+		assert.Equal(t, secretOCID, vaultClient.LastUpdatedSecretID)
+	})
+
+	t.Run("returns other create errors unchanged", func(t *testing.T) {
+		vaultClient := &fakeoracle.OracleMockVaultClient{
+			SecretSummaries: []vault.SecretSummary{pending},
+			CreateErr:       errors.New("boom"),
+		}
+		vms := &VaultManagementService{
+			encryptionKey: encryptionKey,
+			compartment:   compartment,
+			vault:         vaultID,
+			Client: &fakeoracle.OracleMockClient{
+				SecretBundles: map[string]secrets.SecretBundle{},
+			},
+			VaultClient: vaultClient,
+		}
+
+		secret := &corev1.Secret{Data: map[string][]byte{testSecretKey: []byte("restored-value")}}
+		err := vms.PushSecret(context.Background(), secret, remote)
+		assert.EqualError(t, err, "boom")
+		assert.Equal(t, 0, vaultClient.CancelledCount)
+		assert.Nil(t, vaultClient.LastListRequest.Name)
+	})
+}
+
 func TestOracleVaultDeleteSecret(t *testing.T) {
 	var testCases = map[string]struct {
 		vms       *VaultManagementService
