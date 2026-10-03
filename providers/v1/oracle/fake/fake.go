@@ -24,31 +24,72 @@ import (
 )
 
 type OracleMockVaultClient struct {
-	SecretSummaries []vault.SecretSummary
-	CreatedCount    int
-	UpdatedCount    int
-	DeletedCount    int
+	SecretSummaries       []vault.SecretSummary
+	CreatedCount          int
+	UpdatedCount          int
+	DeletedCount          int
+	CancelledCount        int
+	CreateErr             error
+	CancelErr             error
+	LastUpdatedSecretID   string
+	LastCancelledSecretID string
+	LastListRequest       vault.ListSecretsRequest
+	// OnCancel runs after a deletion cancel is recorded. Tests use it to make
+	// the secret bundle readable again, which is what OCI does once cancel
+	// finishes.
+	OnCancel func()
 }
 
-func (o *OracleMockVaultClient) ListSecrets(_ context.Context, _ vault.ListSecretsRequest) (response vault.ListSecretsResponse, err error) {
+func (o *OracleMockVaultClient) ListSecrets(_ context.Context, request vault.ListSecretsRequest) (response vault.ListSecretsResponse, err error) {
+	o.LastListRequest = request
+	items := o.SecretSummaries
+	if request.Name != nil {
+		filtered := make([]vault.SecretSummary, 0, len(items))
+		for _, item := range items {
+			if item.SecretName != nil && *item.SecretName == *request.Name {
+				filtered = append(filtered, item)
+			}
+		}
+		items = filtered
+	}
 	return vault.ListSecretsResponse{
-		Items: o.SecretSummaries,
+		Items: items,
 	}, nil
 }
 
 func (o *OracleMockVaultClient) CreateSecret(_ context.Context, _ vault.CreateSecretRequest) (response vault.CreateSecretResponse, err error) {
 	o.CreatedCount++
+	if o.CreateErr != nil {
+		return vault.CreateSecretResponse{}, o.CreateErr
+	}
 	return vault.CreateSecretResponse{}, nil
 }
 
-func (o *OracleMockVaultClient) UpdateSecret(_ context.Context, _ vault.UpdateSecretRequest) (response vault.UpdateSecretResponse, err error) {
+func (o *OracleMockVaultClient) UpdateSecret(_ context.Context, request vault.UpdateSecretRequest) (response vault.UpdateSecretResponse, err error) {
 	o.UpdatedCount++
+	if request.SecretId != nil {
+		o.LastUpdatedSecretID = *request.SecretId
+	}
 	return vault.UpdateSecretResponse{}, nil
 }
 
 func (o *OracleMockVaultClient) ScheduleSecretDeletion(_ context.Context, _ vault.ScheduleSecretDeletionRequest) (response vault.ScheduleSecretDeletionResponse, err error) {
 	o.DeletedCount++
 	return vault.ScheduleSecretDeletionResponse{}, nil
+}
+
+func (o *OracleMockVaultClient) CancelSecretDeletion(_ context.Context, request vault.CancelSecretDeletionRequest) (response vault.CancelSecretDeletionResponse, err error) {
+	o.CancelledCount++
+	if request.SecretId != nil {
+		o.LastCancelledSecretID = *request.SecretId
+	}
+	if o.OnCancel != nil {
+		o.OnCancel()
+	}
+	if o.CancelErr != nil {
+		return vault.CancelSecretDeletionResponse{}, o.CancelErr
+	}
+	return vault.CancelSecretDeletionResponse{}, nil
 }
 
 type OracleMockClient struct {
@@ -77,22 +118,24 @@ func (mc *OracleMockClient) WithValue(_ secrets.GetSecretBundleByNameRequest, ou
 }
 
 type ServiceError struct {
-	Code int
+	Code    int
+	Message string
+	OCICode string
 }
 
 func (s *ServiceError) Error() string {
-	return ""
+	return s.Message
 }
 func (s *ServiceError) GetHTTPStatusCode() int {
 	return s.Code
 }
 
 func (s *ServiceError) GetMessage() string {
-	return ""
+	return s.Message
 }
 
 func (s *ServiceError) GetCode() string {
-	return ""
+	return s.OCICode
 }
 
 func (s *ServiceError) GetOpcRequestID() string {

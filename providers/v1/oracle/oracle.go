@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -50,21 +51,33 @@ import (
 )
 
 const (
-	errOracleClient               = "cannot setup new oracle client: %w"
-	errORACLECredSecretName       = "invalid oracle SecretStore resource: missing oracle APIKey"
-	errUninitalizedOracleProvider = "provider oracle is not initialized"
-	errFetchSAKSecret             = "could not fetch SecretAccessKey secret: %w"
-	errMissingPK                  = "missing PrivateKey"
-	errMissingUser                = "missing User ID"
-	errMissingTenancy             = "missing Tenancy ID"
-	errMissingRegion              = "missing Region"
-	errMissingFingerprint         = "missing Fingerprint"
-	errMissingVault               = "missing Vault"
-	errJSONSecretUnmarshal        = "unable to unmarshal secret from JSON: %w"
-	errMissingKey                 = "missing Key in secret: %s"
-	errUnexpectedContent          = "unexpected secret bundle content"
-	errSettingOCIEnvVariables     = "unable to set OCI SDK environment variable %s: %w"
-	errUnsettingOCIEnvVariables   = "unable to unset OCI SDK environment variable %s: %w"
+	errOracleClient                = "cannot setup new oracle client: %w"
+	errORACLECredSecretName        = "invalid oracle SecretStore resource: missing oracle APIKey"
+	errUninitalizedOracleProvider  = "provider oracle is not initialized"
+	errFetchSAKSecret              = "could not fetch SecretAccessKey secret: %w"
+	errMissingPK                   = "missing PrivateKey"
+	errMissingUser                 = "missing User ID"
+	errMissingTenancy              = "missing Tenancy ID"
+	errMissingRegion               = "missing Region"
+	errMissingFingerprint          = "missing Fingerprint"
+	errMissingVault                = "missing Vault"
+	errJSONSecretUnmarshal         = "unable to unmarshal secret from JSON: %w"
+	errMissingKey                  = "missing Key in secret: %s"
+	errUnexpectedContent           = "unexpected secret bundle content"
+	errSettingOCIEnvVariables      = "unable to set OCI SDK environment variable %s: %w"
+	errUnsettingOCIEnvVariables    = "unable to unset OCI SDK environment variable %s: %w"
+	errSecretNameMissing           = "oci vault rejected secret %q because the name already exists, but the secret was not found"
+	errSecretMissingID             = "oci vault secret %q has no id"
+	errSecretPendingDeletion       = "oci vault secret %q is pending deletion until %s; scheduled deletion was canceled and the secret will be updated once it is active"
+	errSecretPendingDeletionNoTime = "oci vault secret %q is pending deletion; scheduled deletion was canceled and the secret will be updated once it is active"
+	errSecretNotReady              = "oci vault secret %q is %s; retry once the vault finishes the previous operation"
+	errSecretNotReusable           = "oci vault secret %q cannot be reused while in state %s"
+)
+
+const (
+	ociCodeInvalidParameter = "InvalidParameter"
+	ociCodeIncorrectState   = "IncorrectState"
+	ociErrNameAlreadyExists = "name already exists"
 )
 
 const (
@@ -109,6 +122,7 @@ type VaultInterface interface {
 	CreateSecret(ctx context.Context, request vault.CreateSecretRequest) (response vault.CreateSecretResponse, err error)
 	UpdateSecret(ctx context.Context, request vault.UpdateSecretRequest) (response vault.UpdateSecretResponse, err error)
 	ScheduleSecretDeletion(ctx context.Context, request vault.ScheduleSecretDeletionRequest) (response vault.ScheduleSecretDeletionResponse, err error)
+	CancelSecretDeletion(ctx context.Context, request vault.CancelSecretDeletionRequest) (response vault.CancelSecretDeletionResponse, err error)
 }
 
 const (
@@ -154,27 +168,155 @@ func (vms *VaultManagementService) PushSecret(ctx context.Context, secret *corev
 				VaultId:    &vms.vault,
 			},
 		})
-		return sanitizeOCISDKErr(err)
+		if err == nil || !isSecretNameAlreadyExists(err) {
+			return sanitizeOCISDKErr(err)
+		}
+		// GetSecretBundleByName returns 404 while a secret is PENDING_DELETION,
+		// but the name stays reserved until OCI finishes deleting it. Create then
+		// fails with "name already exists". Cancel the scheduled deletion and
+		// write the value once the secret is readable again.
+		return vms.reuseReservedSecret(ctx, secretName, encodedValue, value)
 	case SecretExists:
-		payload, err := decodeBundle(sec)
-		if err != nil {
-			return err
-		}
-		if bytes.Equal(payload, value) {
-			return nil
-		}
-		_, err = vms.VaultClient.UpdateSecret(ctx, vault.UpdateSecretRequest{
-			SecretId: sec.SecretId,
-			UpdateSecretDetails: vault.UpdateSecretDetails{
-				SecretContent: vault.Base64SecretContentDetails{
-					Content: &encodedValue,
-				},
-			},
-		})
-		return sanitizeOCISDKErr(err)
+		return vms.pushExistingBundle(ctx, sec, encodedValue, value)
 	default:
 		return sanitizeOCISDKErr(err)
 	}
+}
+
+func (vms *VaultManagementService) pushExistingBundle(ctx context.Context, sec secrets.GetSecretBundleByNameResponse, encodedValue string, value []byte) error {
+	payload, err := decodeBundle(sec)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(payload, value) {
+		return nil
+	}
+	return vms.updateSecretContent(ctx, sec.SecretId, encodedValue)
+}
+
+func (vms *VaultManagementService) updateSecretContent(ctx context.Context, secretID *string, encodedValue string) error {
+	_, err := vms.VaultClient.UpdateSecret(ctx, vault.UpdateSecretRequest{
+		SecretId: secretID,
+		UpdateSecretDetails: vault.UpdateSecretDetails{
+			SecretContent: vault.Base64SecretContentDetails{
+				Content: &encodedValue,
+			},
+		},
+	})
+	return sanitizeOCISDKErr(err)
+}
+
+// reuseReservedSecret recovers a remoteKey whose name OCI still holds.
+// A secret scheduled for deletion is invisible to GetSecretBundleByName, so the
+// create path is taken, and CreateSecret rejects the name until deletion
+// completes. Canceling that deletion makes the name usable again.
+func (vms *VaultManagementService) reuseReservedSecret(ctx context.Context, secretName, encodedValue string, value []byte) error {
+	summary, found, err := vms.findSecretSummary(ctx, secretName)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf(errSecretNameMissing, secretName)
+	}
+	if summary.Id == nil {
+		return fmt.Errorf(errSecretMissingID, secretName)
+	}
+
+	switch summary.LifecycleState {
+	case vault.SecretSummaryLifecycleStatePendingDeletion:
+		_, err = vms.VaultClient.CancelSecretDeletion(ctx, vault.CancelSecretDeletionRequest{
+			SecretId: summary.Id,
+		})
+		if err != nil && !isIncorrectState(err) {
+			return sanitizeOCISDKErr(err)
+		}
+		handled, err := vms.pushIfBundleReadable(ctx, secretName, encodedValue, value)
+		if handled {
+			return err
+		}
+		return pendingDeletionRetryError(secretName, summary)
+	case vault.SecretSummaryLifecycleStateActive:
+		handled, err := vms.pushIfBundleReadable(ctx, secretName, encodedValue, value)
+		if handled {
+			return err
+		}
+		return vms.updateSecretContent(ctx, summary.Id, encodedValue)
+	case vault.SecretSummaryLifecycleStateCreating,
+		vault.SecretSummaryLifecycleStateUpdating,
+		vault.SecretSummaryLifecycleStateSchedulingDeletion,
+		vault.SecretSummaryLifecycleStateCancellingDeletion,
+		vault.SecretSummaryLifecycleStateDeleting:
+		// Vault transitions are asynchronous. The next reconcile retries once
+		// the previous operation settles.
+		return fmt.Errorf(errSecretNotReady, secretName, summary.LifecycleState)
+	case vault.SecretSummaryLifecycleStateFailed,
+		vault.SecretSummaryLifecycleStateDeleted:
+		return fmt.Errorf(errSecretNotReusable, secretName, summary.LifecycleState)
+	default:
+		return fmt.Errorf(errSecretNotReusable, secretName, summary.LifecycleState)
+	}
+}
+
+func (vms *VaultManagementService) pushIfBundleReadable(ctx context.Context, secretName, encodedValue string, value []byte) (bool, error) {
+	sec, action, err := vms.getSecretBundleWithCode(ctx, secretName)
+	switch action {
+	case SecretExists:
+		return true, vms.pushExistingBundle(ctx, sec, encodedValue, value)
+	case SecretAPIError:
+		return true, sanitizeOCISDKErr(err)
+	default:
+		return false, nil
+	}
+}
+
+func (vms *VaultManagementService) findSecretSummary(ctx context.Context, secretName string) (vault.SecretSummary, bool, error) {
+	var page *string
+	for {
+		resp, err := vms.VaultClient.ListSecrets(ctx, vault.ListSecretsRequest{
+			CompartmentId: &vms.compartment,
+			VaultId:       &vms.vault,
+			Name:          &secretName,
+			Page:          page,
+		})
+		if err != nil {
+			return vault.SecretSummary{}, false, sanitizeOCISDKErr(err)
+		}
+		for _, item := range resp.Items {
+			if item.SecretName == nil || *item.SecretName != secretName {
+				continue
+			}
+			if item.LifecycleState == vault.SecretSummaryLifecycleStateDeleted {
+				continue
+			}
+			return item, true, nil
+		}
+		if page = resp.OpcNextPage; page == nil {
+			return vault.SecretSummary{}, false, nil
+		}
+	}
+}
+
+func pendingDeletionRetryError(secretName string, summary vault.SecretSummary) error {
+	if summary.TimeOfDeletion == nil {
+		return fmt.Errorf(errSecretPendingDeletionNoTime, secretName)
+	}
+	return fmt.Errorf(errSecretPendingDeletion, secretName, summary.TimeOfDeletion.UTC().Format(time.RFC3339))
+}
+
+func isSecretNameAlreadyExists(err error) bool {
+	serviceErr, ok := err.(common.ServiceError)
+	if !ok || serviceErr.GetHTTPStatusCode() != 400 || serviceErr.GetCode() != ociCodeInvalidParameter {
+		return false
+	}
+	return strings.Contains(strings.ToLower(serviceErr.GetMessage()), ociErrNameAlreadyExists)
+}
+
+func isIncorrectState(err error) bool {
+	serviceErr, ok := err.(common.ServiceError)
+	if !ok {
+		return false
+	}
+	return serviceErr.GetHTTPStatusCode() == 409 && serviceErr.GetCode() == ociCodeIncorrectState
 }
 
 // DeleteSecret removes a secret from the Oracle Cloud Infrastructure Vault.
